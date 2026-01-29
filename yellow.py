@@ -39,7 +39,11 @@ class YellowRoadDataset(Dataset):
         return self.n
 
     def __getitem__(self, idx):
+        # GREEN background = non-drivable area
         img = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+        img[:] = (0, 160, 0)  # green surroundings
+
+        # Road mask (ONLY yellow road is drivable)
         mask = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint8)
 
         # Generate a random curved road
@@ -50,9 +54,10 @@ class YellowRoadDataset(Dataset):
             x = np.clip(x, 20, IMG_SIZE - 20)
             points.append((x, y))
 
+        # Draw yellow road on green terrain
         for (x, y) in points:
-            cv2.line(img, (x, y), (x, y), (0, 255, 255), ROAD_WIDTH)
-            cv2.line(mask, (x, y), (x, y), 255, ROAD_WIDTH)
+            cv2.circle(img, (x, y), ROAD_WIDTH, (0, 255, 255), -1)  # yellow road
+            cv2.circle(mask, (x, y), ROAD_WIDTH, 255, -1)          # drivable area
 
         img = img.astype(np.float32) / 255.0
         mask = mask.astype(np.float32) / 255.0
@@ -118,9 +123,14 @@ class Car:
         self.y = IMG_SIZE - 10
         self.angle = -math.pi / 2
         self.speed = 2
+        self.penalty = 0
+        self.alive = True
 
-    def update(self, road_mask):
-        # Look ahead
+    def update(self, road_mask, rgb_img):
+        if not self.alive:
+            return
+
+        # Look ahead to find road center
         look_y = max(0, int(self.y - 15))
         row = road_mask[look_y]
         xs = np.where(row > 0.5)[0]
@@ -129,11 +139,25 @@ class Car:
             error = target_x - self.x
             self.angle += error * 0.002
 
+        # Move
         self.x += math.cos(self.angle) * self.speed
         self.y += math.sin(self.angle) * self.speed
 
         self.x = np.clip(self.x, 0, IMG_SIZE - 1)
         self.y = np.clip(self.y, 0, IMG_SIZE - 1)
+
+        # PENALTY: touching green (non-road)
+        px = int(self.x)
+        py = int(self.y)
+
+        # Green terrain check (G channel high, road mask low)
+        if road_mask[py, px] < 0.5:
+            self.penalty += 1
+            self.speed = max(0.5, self.speed - 0.1)
+
+            # Too much green = crash
+            if self.penalty > 30:
+                self.alive = False
 
 # =========================
 # RUN SIMULATION
@@ -149,6 +173,12 @@ def run_sim(model):
 
     model.eval()
 
+    def reset_episode():
+        nonlocal car, img, img_np
+        car = Car()
+        img, _ = dataset[random.randint(0, len(dataset)-1)]
+        img_np = np.transpose(img.numpy(), (1, 2, 0))
+
     img, _ = dataset[0]
     img_np = np.transpose(img.numpy(), (1, 2, 0))
 
@@ -162,16 +192,28 @@ def run_sim(model):
         with torch.no_grad():
             mask = model(inp)[0, 0].cpu().numpy()
 
-        car.update(mask)
+        car.update(mask, img_np)
 
         # Draw
         vis = (img_np * 255).astype(np.uint8)
-        cv2.circle(vis, (int(car.x), int(car.y)), 3, (255, 0, 0), -1)
+        # Draw car (blue = alive, red = crashed)
+        color = (0, 0, 255) if car.alive else (255, 0, 0)
+        cv2.circle(vis, (int(car.x), int(car.y)), 3, color, -1)
+
+        # Draw penalty meter
+        cv2.putText(vis, f"Penalty: {car.penalty}", (5, 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
         surf = pygame.surfarray.make_surface(np.rot90(vis))
         surf = pygame.transform.scale(surf, (IMG_SIZE * scale, IMG_SIZE * scale))
         screen.blit(surf, (0, 0))
         pygame.display.flip()
+
+        # Auto-reset after crash
+        if not car.alive:
+            pygame.time.delay(400)
+            reset_episode()
+
         clock.tick(60)
 
     pygame.quit()
